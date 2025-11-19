@@ -137,13 +137,25 @@ async function saveSeenIds(seenSet) {
 }
 
 // ---------- Open / login FB (server-friendly version) ----------
+// ---------- Open / login FB with visible browser ----------
 async function getBrowserAndPage() {
-  // On the droplet we run headless Chromium
+  // Decide based on env: on the server we run headless
+  const isServer = process.env.RUN_ENV === "server";
+
   const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: process.env.CHROME_PATH || "/usr/bin/chromium-browser",
-    args: ["--no-sandbox", "--disable-setuid-sandbox"]
+    headless: isServer ? "new" : false,
+    defaultViewport: null,
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+    ],
   });
+
+  const page = await browser.newPage();
+  ...
+
 
   const page = await browser.newPage();
 
@@ -445,3 +457,4 @@ main().catch((err) => {
   console.error("❌ Fatal FB bot error:", err);
   process.exit(1);
 });
+
