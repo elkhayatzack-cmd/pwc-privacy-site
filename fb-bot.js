@@ -136,10 +136,9 @@ async function saveSeenIds(seenSet) {
   await fs.writeFile(SEEN_FILE, JSON.stringify(arr, null, 2), "utf8");
 }
 
-// ---------- Open / login FB (server-friendly version) ----------
-// ---------- Open / login FB with visible browser ----------
+// ---------- Open / login FB (server-friendly) ----------
 async function getBrowserAndPage() {
-  // Decide based on env: on the server we run headless
+  // On the droplet we run headless with no sandbox
   const isServer = process.env.RUN_ENV === "server";
 
   const browser = await puppeteer.launch({
@@ -149,13 +148,9 @@ async function getBrowserAndPage() {
       "--no-sandbox",
       "--disable-setuid-sandbox",
       "--disable-dev-shm-usage",
-      "--disable-gpu",
-    ],
+      "--disable-gpu"
+    ]
   });
-
-  const page = await browser.newPage();
-  ...
-
 
   const page = await browser.newPage();
 
@@ -174,7 +169,6 @@ async function getBrowserAndPage() {
     throw err;
   }
 
-  // Confirm login works
   await page.goto("https://www.facebook.com", { waitUntil: "networkidle2" });
   console.log("✅ Facebook loaded with existing session cookies.");
 
@@ -200,7 +194,7 @@ function detectTopics(text) {
 async function getSuggestedReply({ topicKey, text, groupUrl }) {
   if (!openai || !topicKey) {
     if (topicKey === "realestate") {
-      return `Hi! I'm Zack, a local real estate agent in Irvine and surrounding areas. Happy to be a resource if you ever want to chat about neighborhoods, prices, or next steps—no pressure at all.`;
+      return `Hi! I'm Zack, a local real estate agent in Irvine and surrounding areas. Happy to be a resource if you ever want to chat about neighborhoods, prices, or next steps — no pressure at all.`;
     }
     return `Hey! I'm Zack and I run Pickleball & Wellness Collective here in Irvine. If you ever want to hit, learn the game, or find local courts and meetups, I’d love to help.`;
   }
@@ -237,7 +231,7 @@ Do NOT be salesy or pushy.
   } catch (err) {
     console.error("❌ OpenAI error:", err);
     if (topicKey === "realestate") {
-      return `Hi! I'm Zack, a local agent in Irvine/OC. If you ever want a second set of eyes on neighborhoods, prices, or options, I’m happy to help—no pressure.`;
+      return `Hi! I'm Zack, a local agent in Irvine/OC. If you ever want a second set of eyes on neighborhoods, prices, or options, I’m happy to help — no pressure.`;
     }
     return `Hey! I'm Zack and I run a local pickleball group in Irvine. If you’d like to find courts or join a meetup, feel free to reach out.`;
   }
@@ -457,4 +451,3 @@ main().catch((err) => {
   console.error("❌ Fatal FB bot error:", err);
   process.exit(1);
 });
-
