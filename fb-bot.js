@@ -47,7 +47,6 @@ const GROUP_URLS = [
   "https://www.facebook.com/groups/irvinelife",
   "https://www.facebook.com/groups/622910064501669",
   "https://www.facebook.com/groups/ResidentsOfIrvine"
-  
 ];
 
 // ---------- Topic configs (same idea as Reddit) ----------
@@ -69,15 +68,6 @@ const TOPICS = {
       "round robin",
       "event",
       " looking to play"
-    ],
-    cityWords: [
-      "irvine",
-      "tustin",
-      "lake forest",
-      "orange county",
-      "oc",
-      "woodbridge",
-      "great park"
     ]
   },
 
@@ -111,21 +101,12 @@ const TOPICS = {
       "looking for a home",
       "looking for a realtor",
       "does anyone know a realtor",
-      "need a real estate agent",
-    ],
-    cityWords: [
-      "irvine",
-      "tustin",
-      "orange county",
-      "oc",
-      "temecula",
-      "murrieta",
-      "san diego"
+      "need a real estate agent"
     ]
   }
 };
 
-// ---------- Helpers for stdin ----------
+// ---------- Helpers for stdin (still here if you ever run locally) ----------
 function ask(question) {
   return new Promise((resolve) => {
     const rl = readline.createInterface({
@@ -155,41 +136,35 @@ async function saveSeenIds(seenSet) {
   await fs.writeFile(SEEN_FILE, JSON.stringify(arr, null, 2), "utf8");
 }
 
-// ---------- Open / login FB with visible browser ----------
+// ---------- Open / login FB (server-friendly version) ----------
 async function getBrowserAndPage() {
+  // On the droplet we run headless Chromium
   const browser = await puppeteer.launch({
-    headless: false, // visible browser
-    defaultViewport: null
+    headless: true,
+    executablePath: process.env.CHROME_PATH || "/usr/bin/chromium-browser",
+    args: ["--no-sandbox", "--disable-setuid-sandbox"]
   });
 
   const page = await browser.newPage();
 
-  // If we already have cookies, reuse them
+  // We expect fb-cookies.json to already exist (created on your laptop).
   try {
     const cookieRaw = await fs.readFile(COOKIES_PATH, "utf8");
     const cookies = JSON.parse(cookieRaw);
     await page.setCookie(...cookies);
     console.log("🍪 Loaded saved Facebook cookies.");
-  } catch {
-    console.log("🍪 No saved cookies yet, will prompt you to log in.");
-  }
-
-  await page.goto("https://www.facebook.com", { waitUntil: "networkidle2" });
-
-  // If no cookies file, ask user to log in once, then save cookies
-  try {
-    await fs.access(COOKIES_PATH);
-  } catch {
-    console.log(
-      "\n🔑 Please log into Facebook in the browser window.\n" +
-        "   Once you see your normal feed, come back to this terminal."
+  } catch (err) {
+    console.error(
+      "❌ fb-cookies.json not found or unreadable. " +
+        "Create it on your local machine by logging in once and then copy it to the server."
     );
-    await ask("When you're fully logged in, press ENTER here to continue... ");
-
-    const cookies = await page.cookies("https://www.facebook.com");
-    await fs.writeFile(COOKIES_PATH, JSON.stringify(cookies, null, 2), "utf8");
-    console.log("✅ Saved Facebook cookies for future runs.");
+    await browser.close();
+    throw err;
   }
+
+  // Confirm login works
+  await page.goto("https://www.facebook.com", { waitUntil: "networkidle2" });
+  console.log("✅ Facebook loaded with existing session cookies.");
 
   return { browser, page };
 }
@@ -200,12 +175,7 @@ function detectTopics(text) {
   const matched = [];
 
   for (const [key, cfg] of Object.entries(TOPICS)) {
-    const hasKeyword = cfg.keywords.some((kw) =>
-      t.includes(kw.toLowerCase())
-    );
-
-    // We’re already only scanning your chosen local groups, so we don’t
-    // require city words in the post text itself anymore.
+    const hasKeyword = cfg.keywords.some((kw) => t.includes(kw.toLowerCase()));
     if (hasKeyword) {
       matched.push(key);
     }
@@ -217,14 +187,11 @@ function detectTopics(text) {
 // ---------- Suggested reply using OpenAI ----------
 async function getSuggestedReply({ topicKey, text, groupUrl }) {
   if (!openai || !topicKey) {
-    // Fallback if no OpenAI
     if (topicKey === "realestate") {
       return `Hi! I'm Zack, a local real estate agent in Irvine and surrounding areas. Happy to be a resource if you ever want to chat about neighborhoods, prices, or next steps—no pressure at all.`;
     }
     return `Hey! I'm Zack and I run Pickleball & Wellness Collective here in Irvine. If you ever want to hit, learn the game, or find local courts and meetups, I’d love to help.`;
   }
-
-  const topic = TOPICS[topicKey];
 
   const systemPrompt =
     topicKey === "realestate"
@@ -276,7 +243,6 @@ async function sendSummaryEmail(topicKey, leads) {
   const topic = TOPICS[topicKey];
   const label = topic?.displayName || topicKey;
 
-  // Build suggested replies for each lead (one OpenAI call per lead)
   const leadsWithReplies = [];
   for (const lead of leads) {
     const suggestedReply = await getSuggestedReply({
@@ -355,29 +321,22 @@ async function scrapeGroup(page, groupUrl, seenIds, leadsByTopic, { deepScan = f
 
   await page.goto(groupUrl, { waitUntil: "networkidle2" });
 
-  // Scroll to load posts
   const scrollRounds = deepScan ? 10 : 3;
 
   for (let i = 0; i < scrollRounds; i++) {
     await page.evaluate(() => {
       window.scrollBy(0, window.innerHeight);
     });
-
-    // 2-second pause so Facebook can load more posts
     await new Promise((resolve) => setTimeout(resolve, 2000));
   }
 
-  // Extract posts
   const posts = await page.evaluate((deep) => {
     const articles = Array.from(document.querySelectorAll('[role="article"]'));
-
-    // Deep scan grabs more posts on first run
     const maxPosts = deep ? 60 : 15;
 
     return articles.slice(0, maxPosts).map((el, idx) => {
       const text = (el.innerText || "").trim();
 
-      // Try to grab some kind of link if available
       let link = null;
       const linkEl =
         el.querySelector('a[href*="/posts/"]') ||
@@ -388,7 +347,6 @@ async function scrapeGroup(page, groupUrl, seenIds, leadsByTopic, { deepScan = f
         link = linkEl.href;
       }
 
-      // Build a pseudo-id based on text + index
       const keyBase = text.slice(0, 80).replace(/\s+/g, " ").trim();
       const pseudoId = `${keyBase}::${idx}`;
 
@@ -407,9 +365,7 @@ async function scrapeGroup(page, groupUrl, seenIds, leadsByTopic, { deepScan = f
 
     const globalId = `${groupUrl}::${post.pseudoId}`;
 
-    if (seenIds.has(globalId)) {
-      continue;
-    }
+    if (seenIds.has(globalId)) continue;
 
     const topics = detectTopics(post.text);
 
@@ -424,23 +380,21 @@ async function scrapeGroup(page, groupUrl, seenIds, leadsByTopic, { deepScan = f
         if (!leadsByTopic[t]) leadsByTopic[t] = [];
         leadsByTopic[t].push({
           groupUrl,
-          groupName: null, // you can enhance this later
+          groupName: null,
           text: post.text,
           postLink: post.postLink
         });
       }
     }
 
-    // Mark as seen regardless of whether it was a lead
     seenIds.add(globalId);
   }
 }
 
 // ---------- Main ----------
 async function main() {
-  console.log("🤖 Facebook Groups bot starting (visible browser)…");
+  console.log("🤖 Facebook Groups bot starting (headless on server)…");
 
-  // Detect if this is the very first run (no seen-fb-posts.json yet)
   let isFirstRun = false;
   try {
     await fs.access(SEEN_FILE);
@@ -471,7 +425,6 @@ async function main() {
     await browser.close();
   }
 
-  // Send summary emails
   if (leadsByTopic.pickleball.length > 0) {
     await sendSummaryEmail("pickleball", leadsByTopic.pickleball);
   } else {
