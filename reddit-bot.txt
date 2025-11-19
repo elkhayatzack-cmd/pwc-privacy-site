@@ -1,0 +1,397 @@
+
+// reddit-bot.js
+import "dotenv/config";
+import fetch from "node-fetch";
+import { Resend } from "resend";
+import { OpenAI } from "openai";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+
+// ---------- Paths / persistence (for "no repeats") ----------
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const SEEN_FILE = path.join(__dirname, "seen-reddit-posts.json");
+
+// Load / save seen post IDs
+async function loadSeenIds() {
+  try {
+    const raw = await fs.readFile(SEEN_FILE, "utf8");
+    const arr = JSON.parse(raw);
+    return new Set(arr);
+  } catch {
+    return new Set();
+  }
+}
+
+async function saveSeenIds(seenSet) {
+  const arr = [...seenSet];
+  await fs.writeFile(SEEN_FILE, JSON.stringify(arr, null, 2), "utf8");
+}
+
+// ---------- Env / clients ----------
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const LEAD_NOTIFY_EMAIL = process.env.LEAD_NOTIFY_EMAIL || "elkhayatzack@gmail.com";
+const LEAD_FROM_EMAIL =
+  process.env.LEAD_FROM_EMAIL || "Pickleball Leads <onboarding@resend.dev>";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+
+const resend = RESEND_API_KEY ? new Resend(RESEND_API_KEY) : null;
+const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
+
+// ---------- Topic configs (pickleball + real estate) ----------
+const TOPICS = {
+  // 🔹 Pickleball: ~15 miles around Irvine
+  pickleball: {
+    displayName: "Pickleball",
+    subreddits: ["irvine", "orangecounty", "pickleball"],
+    keywords: [
+      "pickleball",
+      "paddle",
+      "paddles",
+      "court",
+      "courts",
+      "where to play",
+      "anyone play",
+      "open play",
+      "rec center",
+      "league",
+      "clinic",
+      "lessons",
+      "beginner",
+      "beginners"
+    ],
+    // Cities ~15 miles from Irvine
+    cityWords: [
+      "irvine",
+      "tustin",
+      "lake forest",
+      "laguna hills",
+      "laguna niguel",
+      "mission viejo",
+      "orange",
+      "newport beach",
+      "costa mesa",
+      "santa ana",
+      "fountain valley"
+    ],
+    emailSubjectPrefix: "Pickleball Leads",
+    systemPrompt:
+      'You write concise, warm, non-spammy Reddit comments as Zack, organizer of a local pickleball group in Irvine called "Pickleball & Wellness Collective".',
+    personaInstructions: `
+You are Zack, a friendly organizer of "Pickleball & Wellness Collective" in Irvine.
+Write a short, friendly public reply (2–4 sentences) that:
+- acknowledges their question/post about pickleball
+- mentions you're local to Irvine / nearby OC cities
+- invites them to connect, DM you, or join a meetup
+- does NOT sound like spam or a hard sales pitch.
+`
+  },
+
+  // 🔹 Real Estate: all of OC + Temecula/Murrieta + San Diego County
+  realestate: {
+    displayName: "Real Estate",
+    subreddits: [
+      "irvine",
+      "orangecounty",
+      "RealEstate",
+      "RealEstateInvesting",
+      "sandiego",
+      "temecula",
+      "murrieta"
+    ],
+    keywords: [
+      "moving to",
+      "relocating to",
+      "move to",
+      "townhouse",
+      "house",
+      "home prices",
+      "house prices",
+      "neighborhoods",
+      "buy a house",
+      "buying a house",
+      "buying my first home",
+      "mortgage",
+      "realtor",
+      "real estate",
+      "broker"
+    ],
+    // OC + Temecula valley + San Diego County
+    cityWords: [
+      // Orange County
+      "irvine",
+      "tustin",
+      "orange",
+      "anaheim",
+      "santa ana",
+      "costa mesa",
+      "newport beach",
+      "huntington beach",
+      "garden grove",
+      "fullerton",
+      "lake forest",
+      "mission viejo",
+      "laguna niguel",
+      "laguna hills",
+      "laguna beach",
+      "dana point",
+      "fountain valley",
+      "yorba linda",
+      "placentia",
+
+      // Temecula Valley / nearby
+      "temecula",
+      "murrieta",
+      "wildomar",
+      "menifee",
+
+      // San Diego County
+      "san diego",
+      "carlsbad",
+      "oceanside",
+      "vista",
+      "san marcos",
+      "encinitas",
+      "solana beach",
+      "la jolla",
+      "poway",
+    ],
+    emailSubjectPrefix: "Real Estate Leads",
+    systemPrompt:
+      "You write concise, warm Reddit comments as Zack, a local real estate agent who is helpful and not pushy.",
+    personaInstructions: `
+You are Zack, a friendly real estate agent serving Irvine, all of Orange County, Temecula/Murrieta, and San Diego County.
+Write a short, friendly public reply (2–4 sentences) that:
+- acknowledges their housing/real-estate question or situation
+- mentions you're local and familiar with the area they referenced
+- offers to answer questions or chat further with no pressure
+- does NOT sound spammy or like a hard sales pitch.
+`
+  }
+};
+
+// Build union of all subreddits across topics
+const ALL_SUBREDDITS = Array.from(
+  new Set(Object.values(TOPICS).flatMap((t) => t.subreddits))
+);
+
+// ---------- Topic detection ----------
+function detectTopics(post) {
+  const text = (post.title + " " + (post.selftext || "")).toLowerCase();
+  const matched = [];
+
+  for (const [key, cfg] of Object.entries(TOPICS)) {
+    const hasKeyword = cfg.keywords.some((kw) => text.includes(kw.toLowerCase()));
+    const hasCity =
+      (cfg.cityWords || []).length === 0
+        ? true
+        : cfg.cityWords.some((c) => text.includes(c.toLowerCase()));
+
+    if (hasKeyword && hasCity) {
+      matched.push(key);
+    }
+  }
+
+  return matched;
+}
+
+// ---------- Suggested reply using OpenAI ----------
+async function getSuggestedReply({ topicKey, title, selftext, subreddit, url }) {
+  const topic = TOPICS[topicKey];
+
+  if (!openai || !topic) {
+    // Fallback if no OPENAI_API_KEY or unknown topic
+    if (topicKey === "realestate") {
+      return `Hi! I'm Zack, a local real estate agent for OC/Temecula/San Diego and saw your post about "${title}". Happy to share what I know about neighborhoods, prices, or next steps if that would be helpful—no pressure at all.`;
+    }
+
+    return `Hi! I run Pickleball & Wellness Collective in Irvine. I saw your post about "${title}". If you’d like to play or learn more about local pickleball options, I’d be happy to share courts, meetups, and beginner-friendly options nearby.`;
+  }
+
+  try {
+    const userText = `
+Subreddit: r/${subreddit}
+Title: ${title}
+Body: ${selftext || "(no body text)"}
+Link: ${url}
+
+${topic.personaInstructions}
+`;
+
+    const resp = await openai.chat.completions.create({
+      model: "gpt-4.1",
+      messages: [
+        { role: "system", content: topic.systemPrompt },
+        { role: "user", content: userText }
+      ]
+    });
+
+    return resp.choices[0].message.content.trim();
+  } catch (err) {
+    console.error("❌ OpenAI error while building suggested reply:", err);
+
+    if (topicKey === "realestate") {
+      return `Hi! I'm Zack, a local real estate agent for OC/Temecula/San Diego and saw your post about "${title}". Happy to share what I know about neighborhoods, prices, or next steps if that would be helpful—no pressure at all.`;
+    }
+
+    return `Hi! I run Pickleball & Wellness Collective in Irvine and would love to help with your question about "${title}". Happy to share local courts and meetup options if you’re interested.`;
+  }
+}
+
+// ---------- Batched topic summary email ----------
+async function sendTopicSummaryEmail(topicKey, leads) {
+  if (!resend) {
+    console.warn("⚠ Resend not configured, skipping email.");
+    return;
+  }
+  if (!leads.length) return;
+
+  const topic = TOPICS[topicKey];
+  const topicLabel = topic.displayName;
+
+  const piecesHtml = [];
+  const piecesText = [];
+
+  let index = 1;
+  for (const { post, subreddit } of leads) {
+    const url = `https://www.reddit.com${post.permalink}`;
+    const suggestedReply = await getSuggestedReply({
+      topicKey,
+      title: post.title,
+      selftext: post.selftext,
+      subreddit,
+      url
+    });
+
+    piecesHtml.push(`
+      <h3>${index}. ${post.title}</h3>
+      <p><strong>Subreddit:</strong> r/${subreddit}</p>
+      <p><strong>Author:</strong> u/${post.author}</p>
+      <p><strong>Score:</strong> ${post.score}</p>
+      <p><strong>Link:</strong> <a href="${url}" target="_blank">${url}</a></p>
+      <p><strong>Suggested reply:</strong></p>
+      <p style="white-space: pre-wrap; font-family: system-ui, sans-serif;">
+        ${suggestedReply}
+      </p>
+      <hr/>
+    `);
+
+    piecesText.push(`
+${index}. ${post.title}
+Subreddit: r/${subreddit}
+Author: u/${post.author}
+Score: ${post.score}
+Link: ${url}
+
+Suggested reply:
+${suggestedReply}
+`.trim());
+
+    index += 1;
+  }
+
+  const subject = `NEW Reddit ${topic.emailSubjectPrefix}: ${leads.length} new post(s)`;
+
+  const html = `
+    <h2>${topicLabel} Reddit Leads</h2>
+    <p>You have ${leads.length} new potential ${topicLabel.toLowerCase()} lead(s) from Reddit.</p>
+    ${piecesHtml.join("\n")}
+  `;
+
+  const text = `
+${topicLabel} Reddit Leads
+
+You have ${leads.length} new potential ${topicLabel.toLowerCase()} lead(s) from Reddit.
+
+${piecesText.join("\n\n------------------------------\n\n")}
+`.trim();
+
+  const res = await resend.emails.send({
+    from: LEAD_FROM_EMAIL,
+    to: LEAD_NOTIFY_EMAIL,
+    subject,
+    html,
+    text
+  });
+
+  console.log(`📧 ${topicLabel} summary email SUCCESS:`, res?.data?.id || res);
+}
+
+// ---------- Fetch + scan ----------
+async function fetchSubreddit(subreddit) {
+  const url = `https://www.reddit.com/r/${subreddit}/new.json?limit=25`;
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": "pwc-leads-bot/1.0 by elkhayatzack"
+    }
+  });
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch r/${subreddit}: ${res.status}`);
+  }
+
+  const json = await res.json();
+  return json.data.children.map((c) => c.data);
+}
+
+// ---------- Main ----------
+async function main() {
+  console.log("🤖 Reddit bot starting…");
+  const seenIds = await loadSeenIds();
+
+  // Collect leads by topic for this run
+  const leadsByTopic = {
+    pickleball: [],
+    realestate: []
+  };
+
+  for (const subreddit of ALL_SUBREDDITS) {
+    try {
+      const posts = await fetchSubreddit(subreddit);
+      console.log(`📥 Fetched ${posts.length} posts from r/${subreddit}`);
+
+      for (const post of posts) {
+        const id = post.id;
+
+        // Never process same post twice across runs
+        if (seenIds.has(id)) {
+          continue;
+        }
+
+        const topics = detectTopics(post);
+
+        if (topics.length > 0) {
+          console.log(
+            `🎯 Reddit LEAD DETECTED [${topics
+              .map((t) => TOPICS[t]?.displayName || t)
+              .join(", ")}]: r/${subreddit} – ${post.title}`
+          );
+
+          // Add this post to each matching topic bucket
+          for (const t of topics) {
+            if (!leadsByTopic[t]) leadsByTopic[t] = [];
+            leadsByTopic[t].push({ post, subreddit });
+          }
+        }
+
+        // Mark as seen whether it was a lead or not
+        seenIds.add(id);
+      }
+    } catch (err) {
+      console.error(`❌ Error processing r/${subreddit}:`, err);
+    }
+  }
+
+  // Send at most one email per topic
+  await sendTopicSummaryEmail("pickleball", leadsByTopic.pickleball || []);
+  await sendTopicSummaryEmail("realestate", leadsByTopic.realestate || []);
+
+  await saveSeenIds(seenIds);
+  console.log("✅ Reddit bot run complete.");
+}
+
+main().catch((err) => {
+  console.error("❌ Fatal Reddit bot error:", err);
+  process.exit(1);
+});
