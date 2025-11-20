@@ -145,10 +145,24 @@ async function getBrowserAndPage() {
     headless: isServer ? "new" : false,
     defaultViewport: null,
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu"
+     args: [
+  "--no-sandbox",
+  "--disable-setuid-sandbox",
+  "--disable-dev-shm-usage",
+  "--disable-gpu",
+  "--disable-software-rasterizer",
+  "--no-zygote",
+  "--single-process",
+  "--disable-extensions",
+  "--disable-features=IsolateOrigins,site-per-process,Translate",
+  "--disable-background-networking",
+  "--disable-background-timer-throttling",
+  "--disable-breakpad",
+  "--disable-sync",
+  "--metrics-recording-only",
+  "--mute-audio"
+]
+
     ]
   });
 
@@ -451,3 +465,4 @@ main().catch((err) => {
   console.error("❌ Fatal FB bot error:", err);
   process.exit(1);
 });
+
